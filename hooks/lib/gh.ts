@@ -1,5 +1,5 @@
 /** Runs a command by argv (no shell). The mod's runner is `$.process.run`; tests pass fixtures. */
-export type Runner = (argv: readonly string[], opts?: { timeoutMs?: number }) => Promise<{ exitCode: number; stdout: string; stderr: string }>
+export type Runner = (argv: readonly string[], opts?: { timeoutMs?: number; cwd?: string; env?: Record<string, string> }) => Promise<{ exitCode: number; stdout: string; stderr: string }>
 
 /** A run's log can be large; it gets longer than an ordinary gh call. */
 export const LOG_TIMEOUT_MS = 20_000
