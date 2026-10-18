@@ -4,14 +4,14 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { Meta, TaskList, Track } from '../types'
 import { INPUT_SCHEMA, parseInput, type ToolInput } from './lib/input'
 import { isShown, joinSegments, listLine, parsePr, plainLine, repoFromRemote, trackLine, type Segment } from './lib/model'
-import { DEFAULT_CONFIG, type Config } from './lib/config'
+import { DEFAULT_CONFIG, parseConfig, type Config } from './lib/config'
 import { GhError, type Runner } from './lib/gh'
 import { addTrackStep, annotate, emptyPersisted, listSet, migrate, newTrack, setListStep, setTrackStep, sweep, type Persisted } from './lib/ops'
 import { apply, gather, shapeStages } from './lib/pipeline'
 
 const tracksAtom = atom({ plugin: 'ship-progress', key: 'tracks' } as const, [])
 const listsAtom = atom({ plugin: 'ship-progress', key: 'lists' } as const, [])
-const metaAtom = atom({ plugin: 'ship-progress', key: 'meta' } as const, { repo: null, ghError: null, now: 0 })
+const metaAtom = atom({ plugin: 'ship-progress', key: 'meta' } as const, { repo: null, ghError: null, configError: null, now: 0 })
 
 const TOOL = 'mcp__ship-progress__ship_progress'
 const MAX_LINES = 5
@@ -30,6 +30,8 @@ let p: Persisted = emptyPersisted()
 let storeKey = 'repo:-'
 let repo: string | null = null
 let config: Config = DEFAULT_CONFIG
+let configPath: string | null = null
+let configMtime = -1
 
 // Polling: when the next poll is due, the interval after a gh error, and the round-robin cursor.
 let nextPollAt = 0
@@ -42,7 +44,25 @@ const defaultBranches = new Map<string, string>()
 const configFor = (r: string) => (r === repo ? config : DEFAULT_CONFIG)
 
 function runner($: $): Runner {
-  return argv => $.process.run(argv, { timeoutMs: GH_TIMEOUT_MS })
+  return (argv, opts) => $.process.run(argv, { timeoutMs: opts?.timeoutMs ?? GH_TIMEOUT_MS })
+}
+
+/** Reads `.claude/ship-progress.json` when its mtime changed; a bad file falls back to the defaults and says why. */
+async function loadConfig($: $) {
+  if (!configPath) return
+  const stat = await $.fs.stat(configPath).catch(() => undefined)
+  const mtime = stat?.mtimeMs ?? 0
+  if (mtime === configMtime) return
+  configMtime = mtime
+  let error: string | null = null
+  try {
+    config = stat ? parseConfig(await $.fs.read(configPath)) : DEFAULT_CONFIG
+  } catch (err) {
+    config = DEFAULT_CONFIG
+    error = `.claude/ship-progress.json: ${err instanceof Error ? err.message : String(err)}`
+  }
+  await setMeta($, { configError: error })
+  nextPollAt = 0
 }
 
 function now($: $) {
@@ -71,6 +91,7 @@ async function tick($: $) {
   if (swept.tracks.length !== p.tracks.length || swept.lists.length !== p.lists.length) await commit($, () => swept)
   // Redraw elapsed times only while something is on the bar.
   if (shown) await setMeta($, { now: t })
+  await loadConfig($)
   if (t >= nextPollAt && !isPolling) {
     isPolling = true
     try {
@@ -91,11 +112,12 @@ async function poll($: $, t: number) {
   const batch = Array.from({ length: Math.min(TRACKS_PER_TICK, active.length) }, (_, i) => active[(cursor + i) % active.length]!)
   cursor = (cursor + batch.length) % Math.max(1, active.length)
   const run = runner($)
+  const cache = { logShas: { ...p.logShas }, contains: { ...p.contains } }
   try {
     for (const track of batch) {
       const cfg = configFor(track.repo)
-      const facts = await gather(track, { run, config: cfg, now: t, defaultBranches })
-      await commit($, x => ({ ...x, tracks: x.tracks.map(y => (y.key === track.key ? apply(y, facts, cfg, t) : y)) }))
+      const facts = await gather(track, { run, config: cfg, now: t, defaultBranches, localRepo: repo, cache })
+      await commit($, x => ({ ...x, logShas: cache.logShas, contains: cache.contains, tracks: x.tracks.map(y => (y.key === track.key ? apply(y, facts, cfg, t) : y)) }))
     }
     backoffMs = 0
     await setMeta($, { ghError: null })
@@ -189,12 +211,17 @@ async function runTool($: $, input: ToolInput): Promise<string> {
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
-    repo = repoFromRemote((await $.session.repo())?.remote)
+    const r = await $.session.repo()
+    repo = repoFromRemote(r?.remote)
+    configPath = r ? `${r.root}/.claude/ship-progress.json` : null
+    configMtime = -1
+    config = DEFAULT_CONFIG
     storeKey = `repo:${repo ?? '-'}`
     p = sweep(migrate(await $.store.get(storeKey)), await now($))
     nextPollAt = 0
     await commit($, x => x)
-    await setMeta($, { repo, ghError: null, now: await now($) })
+    await setMeta($, { repo, ghError: null, configError: null, now: await now($) })
+    await loadConfig($)
 
     await $.tool.register({
       name: 'ship_progress',
@@ -266,6 +293,7 @@ export const register: Register = on => {
     const { Box, Text } = $.ui.resolve(e)
     const rows = items.slice(0, MAX_LINES).map(i => i.line)
     if (meta.ghError) rows.push([{ text: `⚠ gh: ${meta.ghError}`, color: 'warning' }])
+    if (meta.configError) rows.push([{ text: `⚠ ${meta.configError}`, color: 'warning' }])
     return (
       <Box flexDirection="column">
         {rows.map((line, r) => (

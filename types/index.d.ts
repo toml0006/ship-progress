@@ -13,6 +13,8 @@ export type Stage = {
   /** What the state is about (a run id), so a repeat failure on a new run alerts again. */
   ref?: string
   url?: string
+  /** For a deploy stage, the commit the run actually deployed. */
+  sha?: string
   startedAt?: number
   endedAt?: number
 }
@@ -50,6 +52,8 @@ export type Meta = {
   repo: string | null
   /** Short text of the last `gh` failure, shown on the bar; null when healthy. */
   ghError: string | null
+  /** Why `.claude/ship-progress.json` was not used; null when it loaded or is absent. */
+  configError: string | null
   /** The clock, ticked while something is in flight so elapsed times redraw. */
   now: number
 }

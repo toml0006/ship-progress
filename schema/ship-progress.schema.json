@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/toml0006/ship-progress/main/schema/ship-progress.schema.json",
+  "title": "ship-progress repo config",
+  "description": "Committed at .claude/ship-progress.json. Describes how a PR reaches production in this repo.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "version": { "const": 1 },
+    "ci": {
+      "description": "The workflow (name or file) whose run gates the PR and the default branch. Left out: every check on the PR, and every push-triggered workflow on the default branch.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workflow"],
+      "properties": { "workflow": { "type": "string", "minLength": 1 } }
+    },
+    "deploys": {
+      "description": "Deploys that must all pass after main CI.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "workflow"],
+        "properties": {
+          "name": { "$ref": "#/$defs/name" },
+          "workflow": { "type": "string", "minLength": 1, "description": "Workflow name or .yml file." },
+          "branch": { "type": "string", "description": "Defaults to the default branch." },
+          "deployedSha": {
+            "description": "How to learn which commit a run actually deployed. Use \"log\" for workflow_run-triggered deploys, whose headSha is the branch tip, not the deployed commit.",
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["from"],
+                "properties": { "from": { "const": "headSha" } }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["from", "pattern"],
+                "properties": {
+                  "from": { "const": "log" },
+                  "pattern": { "type": "string", "description": "Regex applied to `gh run view --log`; capture group 1 is the SHA (short or full). The last match wins.", "examples": ["HEAD is now at (\\w+)"] }
+                }
+              }
+            ]
+          },
+          "timeoutMinutes": { "type": "number", "minimum": 1, "maximum": 1440, "default": 45 }
+        }
+      }
+    },
+    "checks": {
+      "description": "Commands run after every deploy passed. Exit 0 means green. They run only after the person approves this list with `/ship-progress trust`.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "argv"],
+        "properties": {
+          "name": { "$ref": "#/$defs/name" },
+          "argv": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string" },
+            "description": "Run with no shell. Whole-element placeholders: {mergeSha}, {prNumber}, {repo}, {deployedSha:<deployName>}."
+          },
+          "intervalSeconds": { "type": "number", "minimum": 10, "maximum": 3600, "default": 60 },
+          "timeoutMinutes": { "type": "number", "minimum": 1, "maximum": 1440, "default": 20 },
+          "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Extra environment. Never put secrets here." }
+        }
+      }
+    },
+    "notify": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "macos": { "type": "boolean", "default": true },
+        "slack": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["webhookEnv"],
+          "properties": {
+            "webhookEnv": { "type": "string", "pattern": "^[A-Z_][A-Z0-9_]*$", "description": "The NAME of the environment variable holding the webhook URL. Never the URL itself." }
+          }
+        },
+        "wakeAgent": { "type": "boolean", "default": true },
+        "on": {
+          "type": "array",
+          "items": { "enum": ["pending", "running", "passed", "failed", "skipped", "superseded", "warning", "done"] },
+          "default": ["failed", "warning", "done"]
+        }
+      }
+    },
+    "doneLingerMinutes": { "type": "number", "minimum": 0, "maximum": 1440, "default": 10 }
+  },
+  "$defs": {
+    "name": { "type": "string", "pattern": "^[\\w .:-]{1,40}$" }
+  }
+}

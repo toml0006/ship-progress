@@ -6,11 +6,11 @@ import { apply, gather, shapeStages, type Ctx } from '../hooks/lib/pipeline'
 import { check, fakeGh, pr, REPO_VIEW, run } from './fixtures/fake-gh'
 
 const NOW = Date.parse('2026-10-18T10:30:00Z')
-const ctx = (r: ReturnType<typeof fakeGh>, config: Config = DEFAULT_CONFIG, now = NOW): Ctx => ({ run: r.run, config, now, defaultBranches: new Map() })
+const ctx = (r: ReturnType<typeof fakeGh>, config: Config = DEFAULT_CONFIG, now = NOW): Ctx => ({ run: r.run, config, now, defaultBranches: new Map(), cache: { logShas: {}, contains: {} } })
 const states = (t: { stages: { id: string; state: string }[] }) => t.stages.map(s => `${s.id}:${s.state}`)
 const step = async (routes: Array<[string, unknown]>, track = newTrack('o/r', 42, NOW - 60_000), config = DEFAULT_CONFIG) => {
   const gh = fakeGh(routes)
-  const facts = await gather(track, ctx(gh, config), undefined)
+  const facts = await gather(track, ctx(gh, config))
   return { track: apply(track, facts, config, NOW), gh }
 }
 
