@@ -90,3 +90,12 @@ test('/track polls on the clock and draws the PR line; gh errors back off and sh
   expect((await $.command.run({ command: 'untrack', args: '#42' } as never)).text).toBe('stopped tracking o/r#42')
   expect((await $.command.run({ command: 'track', args: '' } as never)).text).toMatch(/recent:\n  o\/r#42 untracked/)
 })
+
+test('/ship-progress trust is refused unless the person typed it', async ($, on) => {
+  world(on)
+  await start($)
+  const queued = await $.command.run({ command: 'ship-progress', args: 'trust' } as never)
+  expect(queued.text).toBe('only the person at the prompt can trust checks: type /ship-progress trust')
+  const typed = await $.command.run({ command: 'ship-progress', args: 'trust', origin: { kind: 'composer' } } as never)
+  expect(typed.text).toBe('this repo configures no checks')
+})

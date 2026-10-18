@@ -4,6 +4,7 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { Meta, TaskList, Track } from '../types'
 import { INPUT_SCHEMA, parseInput, type ToolInput } from './lib/input'
 import { isShown, joinSegments, listLine, parsePr, plainLine, repoFromRemote, trackLine, type Segment } from './lib/model'
+import { checksHash } from './lib/checks'
 import { DEFAULT_CONFIG, parseConfig, type Config } from './lib/config'
 import { GhError, type Runner } from './lib/gh'
 import { addTrackStep, annotate, emptyPersisted, listSet, migrate, newTrack, setListStep, setTrackStep, sweep, type Persisted } from './lib/ops'
@@ -32,6 +33,10 @@ let repo: string | null = null
 let config: Config = DEFAULT_CONFIG
 let configPath: string | null = null
 let configMtime = -1
+/** The hash of the config's checks; matches p.trust once the person ran /ship-progress trust. */
+let checksDigest = ''
+let repoRoot: string | null = null
+const checkLastRun: Record<string, number> = {}
 
 // Polling: when the next poll is due, the interval after a gh error, and the round-robin cursor.
 let nextPollAt = 0
@@ -57,6 +62,7 @@ async function loadConfig($: $) {
   let error: string | null = null
   try {
     config = stat ? parseConfig(await $.fs.read(configPath)) : DEFAULT_CONFIG
+    checksDigest = await checksHash(config.checks)
   } catch (err) {
     config = DEFAULT_CONFIG
     error = `${configPath.split('/').slice(-2).join('/')}: ${err instanceof Error ? err.message : String(err)}`
@@ -116,7 +122,8 @@ async function poll($: $, t: number) {
   try {
     for (const track of batch) {
       const cfg = configFor(track.repo)
-      const facts = await gather(track, { run, config: cfg, now: t, defaultBranches, localRepo: repo, cache })
+      const checks = track.repo === repo && repoRoot ? { isTrusted: p.trust === checksDigest, cwd: repoRoot, lastRun: checkLastRun } : undefined
+      const facts = await gather(track, { run, config: cfg, now: t, defaultBranches, localRepo: repo, cache, checks })
       await commit($, x => ({ ...x, logShas: cache.logShas, contains: cache.contains, tracks: x.tracks.map(y => (y.key === track.key ? apply(y, facts, cfg, t) : y)) }))
     }
     backoffMs = 0
@@ -213,6 +220,7 @@ export const register: Register = on => {
     const started = await next(e)
     const r = await $.session.repo()
     repo = repoFromRemote(r?.remote)
+    repoRoot = r?.root ?? null
     // SHIP_PROGRESS_CONFIG points at a config outside the repo, to try one before committing it.
     configPath = (await $.env.get('SHIP_PROGRESS_CONFIG')) || (r ? `${r.root}/.claude/ship-progress.json` : null)
     configMtime = -1
@@ -237,7 +245,7 @@ export const register: Register = on => {
     })
     await $.command.register({ name: 'track', description: 'ship-progress: follow a PR to production, or list tracked PRs', argumentHint: '[PR#|url]' })
     await $.command.register({ name: 'untrack', description: 'ship-progress: stop following a PR', argumentHint: '<PR#>' })
-    await $.command.register({ name: 'ship-progress', description: 'ship-progress: show status, or clear task lists', argumentHint: '[status|clear]' })
+    await $.command.register({ name: 'ship-progress', description: 'ship-progress: show status, trust this repo\'s checks, or clear task lists', argumentHint: '[status|trust|clear]' })
 
     $.clock.every(TICK_MS, () => void tick($).catch(err => $.ui.log(`ship-progress tick failed: ${String(err)}`, { to: 'debug' })))
     return started
@@ -270,12 +278,22 @@ export const register: Register = on => {
 
   on('command.run', { command: 'ship-progress' }, async ($, e) => {
     const [sub = 'status'] = e.args.trim().split(/\s+/).filter(Boolean)
+    if (sub === 'trust') {
+      // Checks run commands from a committed file: only the person, typing at their own prompt, approves them.
+      const who = e.origin?.kind
+      if (who !== 'composer' && who !== 'bridge') return { text: 'only the person at the prompt can trust checks: type /ship-progress trust' }
+      if (config.checks.length === 0) return { text: 'this repo configures no checks' }
+      await commit($, x => ({ ...x, trust: checksDigest }))
+      nextPollAt = 0
+      const list = config.checks.map(c => `  ${c.name}: ${JSON.stringify(c.argv)}${c.env ? ` env ${JSON.stringify(Object.keys(c.env))}` : ''}`)
+      return { text: [`trusted ${config.checks.length} check(s) for ${repo ?? 'this repo'}; any change to them asks again:`, ...list].join('\n') }
+    }
     if (sub === 'clear') {
       const n = p.lists.length
       await commit($, x => ({ ...x, lists: [] }))
       return { text: `cleared ${n} task list(s); PR tracks are kept (use /untrack)` }
     }
-    if (sub !== 'status') return { text: `unknown subcommand "${sub}" (status, clear)` }
+    if (sub !== 'status') return { text: `unknown subcommand "${sub}" (status, trust, clear)` }
     const t = await now($)
     const lines = [...p.tracks.map(x => trackLine(x, t, repo)), ...p.lists.map(x => listLine(x, t))]
     return { text: lines.length ? lines.map(plainLine).join('\n') : 'nothing tracked' }

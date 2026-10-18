@@ -1,4 +1,5 @@
 import type { Stage, StageState, Track } from '../../types'
+import { runCheck } from './checks'
 import type { Config, DeployConfig } from './config'
 import { branchPrMerged, compareContains, defaultBranch, prView, runList, runLog, type PrInfo, type RollupItem, type Run, type Runner } from './gh'
 import { currentStage, isSettled, moveStage } from './model'
@@ -16,6 +17,8 @@ export type Facts = {
   mainCi?: StageFact
   /** By deploy name; present once main CI has passed. */
   deploys: Record<string, StageFact>
+  /** By check name; present for the checks run (or refused) on this poll. */
+  checks: Record<string, StageFact>
 }
 
 export type Ctx = {
@@ -28,6 +31,8 @@ export type Ctx = {
   localRepo?: string | null
   /** Read and filled while gathering; the caller persists them. */
   cache: { logShas: Record<string, string>; contains: Record<string, boolean> }
+  /** Custom checks: whether the person trusted this config's checks, where to run them, and when each last ran. */
+  checks?: { isTrusted: boolean; cwd: string; lastRun: Record<string, number> }
 }
 
 /** How long after a merge, with no CI config and no push run, main CI counts as absent. */
@@ -193,6 +198,31 @@ export const deployFact = async (ctx: Ctx, repo: string, pr: PrInfo, branch: str
   return { state: 'pending' }
 }
 
+/** Runs the checks that are due, once main CI and every deploy have passed. */
+const checkFacts = async (ctx: Ctx, track: Track, f: Facts): Promise<Record<string, StageFact>> => {
+  const out: Record<string, StageFact> = {}
+  if (ctx.config.checks.length === 0 || !ctx.checks) return out
+  // The track as this poll leaves its deploys, so {deployedSha:<name>} resolves.
+  const stages = track.stages.map(s => {
+    const d = s.id.startsWith('deploy:') ? f.deploys[s.label] : undefined
+    return d ? { ...s, state: d.state, sha: d.deployedSha } : s
+  })
+  if (!stages.filter(s => s.id.startsWith('deploy:')).every(s => s.state === 'passed')) return out
+  const now = { ...track, stages, mergeSha: f.pr.mergeCommit?.oid }
+  for (const c of ctx.config.checks) {
+    const key = `${track.key}|${c.name}`
+    if (stages.some(s => s.id === `check:${c.name}` && s.state === 'passed')) continue
+    if (!ctx.checks.isTrusted) {
+      out[c.name] = { state: 'warning', note: 'checks not trusted: type /ship-progress trust' }
+      continue
+    }
+    if (ctx.now - (ctx.checks.lastRun[key] ?? 0) < c.intervalSeconds * 1000) continue
+    ctx.checks.lastRun[key] = ctx.now
+    out[c.name] = await runCheck(ctx.run, c, now, ctx.checks.cwd)
+  }
+  return out
+}
+
 /** Asks GitHub about one track. Throws GhError when gh fails; the caller backs off. */
 export const gather = async (track: Track, ctx: Ctx): Promise<Facts> => {
   const pr = await prView(ctx.run, track.repo, track.number)
@@ -202,7 +232,7 @@ export const gather = async (track: Track, ctx: Ctx): Promise<Facts> => {
     ctx.defaultBranches.set(track.repo, branch)
   }
   const baseMerged = pr.state === 'OPEN' && pr.baseRefName !== branch ? await branchPrMerged(ctx.run, track.repo, pr.baseRefName) : false
-  const facts: Facts = { pr, defaultBranch: branch, baseMerged, prCi: await prCiFact(ctx, track.repo, pr), deploys: {} }
+  const facts: Facts = { pr, defaultBranch: branch, baseMerged, prCi: await prCiFact(ctx, track.repo, pr), deploys: {}, checks: {} }
   if (pr.state === 'MERGED' && pr.mergeCommit) {
     facts.mainCi = await mainCiFact(ctx, track.repo, pr, branch)
     if (facts.mainCi.state === 'passed' || facts.mainCi.state === 'skipped') {
@@ -211,6 +241,7 @@ export const gather = async (track: Track, ctx: Ctx): Promise<Facts> => {
         if (track.stages.some(s => s.id === `deploy:${d.name}` && s.state === 'passed')) continue
         facts.deploys[d.name] = await deployFact(ctx, track.repo, pr, branch, d)
       }
+      facts.checks = await checkFacts(ctx, track, facts)
     }
   }
   return facts
@@ -259,25 +290,34 @@ const factFor = (stage: Stage, f: Facts, branch: string): StageFact | undefined 
         if (stage.state === 'passed') return undefined
         return f.deploys[stage.label] ?? { state: 'pending' }
       }
+      // A check not run on this poll keeps its state; a passed one stays passed.
+      if (stage.id.startsWith('check:') && stage.state !== 'passed') return f.checks[stage.label]
       return undefined
   }
 }
 
-/** A deploy that has waited past its timeout without passing or failing fails. */
+/** A deploy or check that has waited past its timeout without passing fails. Untrusted checks wait for the person. */
 const timedOut = (s: Stage, config: Config, now: number): Stage | undefined => {
-  if (!s.id.startsWith('deploy:') || isSettled(s.state) || s.state === 'failed' || s.startedAt === undefined) return undefined
+  if (isSettled(s.state) || s.state === 'failed' || s.startedAt === undefined) return undefined
   const d = config.deploys.find(x => `deploy:${x.name}` === s.id)
-  if (!d || now - s.startedAt < d.timeoutMinutes * 60_000) return undefined
-  return moveStage(s, 'failed', now, { note: `no deploy within ${d.timeoutMinutes} min${s.note ? ` (${s.note})` : ''}` })
+  const c = config.checks.find(x => `check:${x.name}` === s.id)
+  const minutes = d?.timeoutMinutes ?? c?.timeoutMinutes
+  if (minutes === undefined || now - s.startedAt < minutes * 60_000) return undefined
+  if (c && s.state === 'warning') return undefined
+  const what = d ? `no deploy within ${minutes} min` : `still failing after ${minutes} min`
+  return moveStage(s, 'failed', now, { note: `${what}${s.note ? ` (${s.note})` : ''}` })
 }
 
 /** Folds facts into a track: stage states, SHAs, and whether it is done or closed. Pure. */
 export const apply = (track: Track, f: Facts, config: Config, now: number): Track => {
   const stages = shapeStages(track.stages, config).map(s => {
-    const fact = s.owner === 'mod' ? factFor(s, f, f.defaultBranch) : undefined
-    if (!fact) return s
-    const { state, deployedSha, ...extra } = fact
-    const next = moveStage(s, state, now, { note: undefined, ref: undefined, url: undefined, sha: deployedSha, ...extra })
+    if (s.owner !== 'mod') return s
+    const fact = factFor(s, f, f.defaultBranch)
+    let next = s
+    if (fact) {
+      const { state, deployedSha, ...extra } = fact
+      next = moveStage(s, state, now, { note: undefined, ref: undefined, url: undefined, sha: deployedSha, ...extra })
+    }
     return timedOut(next, config, now) ?? next
   })
   // The stage being waited on shows how long it has waited.
