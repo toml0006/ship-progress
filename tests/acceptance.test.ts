@@ -65,3 +65,62 @@ test('a done track lingers for doneLingerMinutes, then the bar is hidden (AC13)'
   expect(JSON.stringify(await ui.drawn())).toContain('ENGINE')
   expect((await $.command.run({ command: 'track', args: '' } as never)).text).toMatch(/recent:\n  o\/r#42 done merge222/)
 })
+
+test('a trusted check runs through $.process.run with the repo root as cwd and its env (review fix)', async ($, on) => {
+  const config = JSON.stringify({ version: 1, checks: [{ name: 'drained', argv: ['./scripts/drained.sh', '{prNumber}'], env: { STAGE: 'staging' }, intervalSeconds: 10 }] })
+  const clock = mock.clock(on, { now: T0 })
+  mock.store(on, {})
+  mock.env(on, {})
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  on('session.repo', () => ({ value: { root: '/r', remote: 'git@github.com:o/r.git', internal: false, name: null } }))
+  on('tool.register', ($, e) => ({ value: { tool: `mcp__ship-progress__${e.name}` } }))
+  on('command.register', ($, e) => ({ value: { command: e.name } }))
+  on('fs.stat', () => ({ value: { kind: 'file', size: config.length, mtimeMs: 1, isLink: false } }))
+  on('fs.read', () => ({ value: config }))
+  const gh = fakeGh([['pr view 42', MERGED], REPO_VIEW, ['run list', [run(7)]]])
+  const scripts: unknown[] = []
+  on('process.run', async ($, e) => {
+    if (e.argv[0] === './scripts/drained.sh') {
+      scripts.push({ argv: e.argv, cwd: e.init?.cwd, env: e.init?.env })
+      return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+    return { value: await gh.run(e.argv) }
+  })
+  await $.session.start({ cwd: '/r', surface: 'terminal', isInteractive: true })
+  // The tool's track action (a review fix too): the agent can add a PR.
+  const tracked = await $.tool.call({ tool: 'mcp__ship-progress__ship_progress', action: 'track', pr: '42' } as never)
+  expect(String(tracked.result)).toBe('tracking o/r#42')
+  await clock.advance(5_000)
+  expect(scripts).toEqual([]) // not trusted yet
+  await $.command.run({ command: 'ship-progress', args: 'trust', origin: { kind: 'composer' } } as never)
+  await clock.advance(5_000)
+  expect(scripts).toEqual([{ argv: ['./scripts/drained.sh', '42'], cwd: '/r', env: { STAGE: 'staging' } }])
+  expect((await $.command.run({ command: 'track', args: '' } as never)).text).toMatch(/recent:|#42 ■■■■\s+live/)
+})
+
+test('a broken config edit keeps the last good config, so deploy stages stay (review fix)', async ($, on) => {
+  const good = JSON.stringify({ version: 1, deploys: [{ name: 'web', workflow: 'Deploy web' }] })
+  let text = good
+  let mtime = 1
+  const clock = mock.clock(on, { now: T0 })
+  mock.store(on, {})
+  mock.env(on, {})
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  on('session.repo', () => ({ value: { root: '/r', remote: 'git@github.com:o/r.git', internal: false, name: null } }))
+  on('tool.register', ($, e) => ({ value: { tool: `mcp__ship-progress__${e.name}` } }))
+  on('command.register', ($, e) => ({ value: { command: e.name } }))
+  on('fs.stat', () => ({ value: { kind: 'file', size: text.length, mtimeMs: mtime, isLink: false } }))
+  on('fs.read', () => ({ value: text }))
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => $.ui.resolve(e).Text({ children: 'ENGINE' }))
+  const gh = fakeGh([['pr view 42', MERGED], REPO_VIEW, ['run list --workflow Deploy web', []], ['run list', [run(7)]]])
+  on('process.run', async ($, e) => ({ value: await gh.run(e.argv) }))
+  await $.session.start({ cwd: '/r', surface: 'terminal', isInteractive: true })
+  await $.command.run({ command: 'track', args: '42' } as never)
+  await clock.advance(5_000)
+  text = '{"version":1,"deploys":[{"name":"web"'
+  mtime = 2
+  await clock.advance(65_000)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /#42 ■■■□\s+web waiting/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /⚠ \.claude\/ship-progress\.json: not valid JSON/ })).toBeDefined()
+})

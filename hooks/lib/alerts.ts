@@ -2,7 +2,8 @@ import type { Stage, Track } from '../../types'
 import type { Config } from './config'
 import { shortSha } from './model'
 
-export type Alert = { key: string; text: string; url?: string }
+/** `text` is for the person (banner, Slack); `wake` is the agent's prompt and holds no text from GitHub or a check. */
+export type Alert = { key: string; text: string; wake: string; url?: string }
 
 const name = (t: Track, repo: string | null) => (t.repo === repo ? `#${t.number}` : `${t.repo}#${t.number}`)
 
@@ -19,11 +20,11 @@ export const transitions = (prev: Track | undefined, next: Track, notify: Config
   for (const s of next.stages) {
     const before = prev?.stages.find(x => x.id === s.id)
     if (before?.state === s.state || !notify.on.includes(s.state)) continue
-    out.push({ key: `${next.key}|${s.id}|${s.state}|${s.ref ?? ''}`, text: `${name(next, repo)} ${stageText(s)}`, url: s.url ?? next.url })
+    out.push({ key: `${next.key}|${s.id}|${s.state}|${s.ref ?? ''}`, text: `${name(next, repo)} ${stageText(s)}`, wake: `${name(next, repo)} ${s.id} ${s.state}`, url: s.url ?? next.url })
   }
   if (next.status === 'done' && prev?.status !== 'done' && notify.on.includes('done')) {
     const sha = next.deployedSha ?? next.mergeSha
-    out.push({ key: `${next.key}|done`, text: `${name(next, repo)} live${sha ? ` (${shortSha(sha)})` : ''}${next.title ? `: ${next.title}` : ''}`, url: next.url })
+    out.push({ key: `${next.key}|done`, text: `${name(next, repo)} live${sha ? ` (${shortSha(sha)})` : ''}${next.title ? `: ${next.title}` : ''}`, wake: `${name(next, repo)} live${sha ? ` (${shortSha(sha)})` : ''}`, url: next.url })
   }
   return out
 }

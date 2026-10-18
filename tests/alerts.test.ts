@@ -14,7 +14,7 @@ describe('transitions', () => {
     const t0 = newTrack('o/r', 42, 0)
     const failed: Track = { ...t0, stages: t0.stages.map(s => (s.id === 'pr-ci' ? { ...s, state: 'failed', note: 'CI / unit failed', ref: 'h1' } : s)) }
     const [a] = transitions(t0, failed, DEFAULT_CONFIG.notify, 'o/r')
-    expect(a).toEqual({ key: 'o/r#42|pr-ci|failed|h1', text: '#42 pr-ci failed: CI / unit failed', url: undefined })
+    expect(a).toEqual({ key: 'o/r#42|pr-ci|failed|h1', text: '#42 pr-ci failed: CI / unit failed', wake: '#42 pr-ci failed', url: undefined })
     expect(transitions(failed, failed, DEFAULT_CONFIG.notify, 'o/r')).toEqual([])
     const done: Track = { ...failed, status: 'done', mergeSha: 'abcdef1234', title: 'Add thing', stages: failed.stages.map(s => ({ ...s, state: 'passed' })) }
     expect(transitions(failed, done, DEFAULT_CONFIG.notify, 'x/y').map(x => x.text)).toEqual(['o/r#42 live (abcdef12): Add thing'])
@@ -87,7 +87,9 @@ test('a failure and a done fire once each on every channel; the webhook URL is n
   await clock.advance(60_000)
   await clock.settle()
   expect(prompts.length).toBe(1)
-  expect(prompts[0]).toMatch(/^ship-progress: #42 pr-ci failed: CI \/ unit failed/)
+  // The agent's prompt is a fixed template: no job name, check output or PR title.
+  expect(prompts[0]).toMatch(/^ship-progress: #42 pr-ci failed https:\/\/github.com\/o\/r\/actions\/runs\/1\/job\/unit\nCall ship_progress/)
+  expect(prompts[0]).not.toContain('CI / unit')
   expect(banners).toEqual(['display notification "#42 pr-ci failed: CI / unit failed" with title "ship-progress"'])
   expect(posts.length).toBe(1)
   expect(posts[0]!.url).toBe(FAKE_WEBHOOK)
@@ -98,7 +100,8 @@ test('a failure and a done fire once each on every channel; the webhook URL is n
   await clock.advance(60_000)
   await clock.settle()
   expect(prompts.length).toBe(2)
-  expect(prompts[1]).toMatch(/^ship-progress: #42 live \(merge222\): Add thing/)
+  expect(prompts[1]).toMatch(/^ship-progress: #42 live \(merge222\) /)
+  expect(prompts[1]).not.toContain('Add thing')
   expect(banners.length).toBe(2)
   expect(posts.length).toBe(2)
 

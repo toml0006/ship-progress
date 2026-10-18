@@ -45,23 +45,30 @@ let isDarwin: boolean | undefined
 let isSlackNoteLogged = false
 const DEFAULT_WEBHOOK_ENV = 'SHIP_PROGRESS_SLACK_WEBHOOK'
 
-/** Directories where a `git push` or a `gh pr` command ran; their branch's PR is looked up on the next tick. */
-const branchLookups = new Set<string>()
+/** Directories where a `git push` or a `gh pr` command ran, and whether a merged PR counts; looked up on the next tick. */
+const branchLookups = new Map<string, boolean>()
 
 // Polling: when the next poll is due, the interval after a gh error, and the round-robin cursor.
 let nextPollAt = 0
 let backoffMs = 0
 let cursor = 0
 let isPolling = false
+/** Set when something asks for a poll now; a poll in progress does not overwrite it. */
+let isPollRequested = false
 const defaultBranches = new Map<string, string>()
 
 const lingerMs = () => config.doneLingerMinutes * 60_000
+
+function requestPoll() {
+  nextPollAt = 0
+  isPollRequested = true
+}
 
 /** Config applies to the session's own repo; tracks in other repos get the defaults. */
 const configFor = (r: string) => (r === repo ? config : DEFAULT_CONFIG)
 
 function runner($: $): Runner {
-  return (argv, opts) => $.process.run(argv, { timeoutMs: opts?.timeoutMs ?? GH_TIMEOUT_MS })
+  return (argv, opts) => $.process.run(argv, { ...opts, timeoutMs: opts?.timeoutMs ?? GH_TIMEOUT_MS })
 }
 
 /** Reads `.claude/ship-progress.json` when its mtime changed; a bad file falls back to the defaults and says why. */
@@ -73,14 +80,17 @@ async function loadConfig($: $) {
   configMtime = mtime
   let error: string | null = null
   try {
-    config = stat ? parseConfig(await $.fs.read(configPath)) : DEFAULT_CONFIG
-    checksDigest = await checksHash(config.checks)
+    const next = stat ? parseConfig(await $.fs.read(configPath)) : DEFAULT_CONFIG
+    const digest = await checksHash(next.checks)
+    // Assigned together, after every await, so a poll never pairs new checks with the old approval.
+    config = next
+    checksDigest = digest
   } catch (err) {
-    config = DEFAULT_CONFIG
+    // A broken edit keeps the last good config: dropping its deploy stages would end tracks early.
     error = `${configPath.split('/').slice(-2).join('/')}: ${err instanceof Error ? err.message : String(err)}`
   }
   await setMeta($, { configError: error })
-  nextPollAt = 0
+  requestPoll()
 }
 
 function now($: $) {
@@ -124,6 +134,7 @@ async function tick($: $) {
 
 /** Polls up to TRACKS_PER_TICK active tracks, round-robin, then schedules the next poll. */
 async function poll($: $, t: number) {
+  isPollRequested = false
   const active = p.tracks.filter(x => x.status === 'active')
   if (active.length === 0) {
     nextPollAt = Number.POSITIVE_INFINITY
@@ -161,7 +172,7 @@ async function poll($: $, t: number) {
   backoffMs = failure ? Math.min(MAX_BACKOFF_MS, Math.max(RUNNING_MS, backoffMs) * 2) : 0
   await setMeta($, { ghError: failure })
   const isRunning = p.tracks.some(x => x.status === 'active' && x.stages.some(s => s.state === 'running'))
-  nextPollAt = t + (backoffMs || (isRunning ? RUNNING_MS : PENDING_MS))
+  nextPollAt = isPollRequested ? 0 : t + (backoffMs || (isRunning ? RUNNING_MS : PENDING_MS))
 }
 
 /** The webhook URL from the environment variable the config names. Never stored, logged or shown. */
@@ -174,9 +185,10 @@ async function webhookUrl($: $, name: string) {
 
 /** Wakes the agent, raises a macOS banner and posts to Slack, as the config allows. */
 async function sendAlert($: $, a: Alert, cfg: Config) {
-  const line = `${a.text}${a.url ? ` ${a.url}` : ''}`
   if (cfg.notify.wakeAgent) {
-    void $.prompt.submit({ text: `ship-progress: ${line}\n(Watch only: the mod changed nothing. Decide whether to act.)` }).catch(() => undefined)
+    // A fixed template: PR titles, job names and check output stay out of the agent's prompt.
+    const text = `ship-progress: ${a.wake}${a.url ? ` ${a.url}` : ''}\nCall ship_progress with action "status" for details. Watch only: the mod changed nothing; decide whether to act.`
+    void $.prompt.submit({ text }).catch(() => undefined)
   }
   if (cfg.notify.macos) {
     isDarwin ??= (await $.process.run(['uname', '-s'], { timeoutMs: 2_000 }).catch(() => undefined))?.stdout.trim() === 'Darwin'
@@ -201,19 +213,20 @@ async function noteHit($: $, hit: Hit) {
     await startTrack($, hit.ref).catch(() => undefined)
     return
   }
-  branchLookups.add(await $.session.cwd())
+  const cwd = await $.session.cwd()
+  branchLookups.set(cwd, hit.isMergedOk || branchLookups.get(cwd) === true)
 }
 
 /** Looks up the current branch's PR where a push ran; tracks it when it is open or just merged. */
 async function resolveBranches($: $) {
   const dirs = [...branchLookups]
   branchLookups.clear()
-  for (const cwd of dirs) {
+  for (const [cwd, isMergedOk] of dirs) {
     const out = await $.process.run(['gh', 'pr', 'view', '--json', 'url,state'], { cwd, timeoutMs: GH_TIMEOUT_MS }).catch(() => undefined)
     if (out?.exitCode !== 0) continue // no PR for this branch
     try {
       const pr = JSON.parse(out.stdout) as { url: string; state: string }
-      if (pr.state === 'OPEN' || pr.state === 'MERGED') await startTrack($, pr.url)
+      if (pr.state === 'OPEN' || (isMergedOk && pr.state === 'MERGED')) await startTrack($, pr.url)
     } catch {
       // unreadable output: nothing to track
     }
@@ -229,8 +242,9 @@ async function startTrack($: $, ref: string) {
   const t = await now($)
   const track = { ...newTrack(r.repo, r.number, t) }
   track.stages = shapeStages(track.stages, configFor(r.repo))
-  await commit($, x => ({ ...x, tracks: [...x.tracks, track] }))
-  nextPollAt = 0
+  // Checked again at the write: a Bash hit, /track and a branch lookup can overlap.
+  await commit($, x => (x.tracks.some(y => y.key === key) ? x : { ...x, tracks: [...x.tracks, track] }))
+  requestPoll()
   return `tracking ${key}`
 }
 
@@ -293,8 +307,9 @@ async function runTool($: $, input: ToolInput): Promise<string> {
     case 'status':
       return JSON.stringify({ repo, tracks: p.tracks, lists: p.lists, history: p.history }, null, 1)
     case 'track':
+      return startTrack($, input.pr)
     case 'untrack':
-      throw new Error(`"${input.action}" is not available yet`)
+      return stopTrack($, input.pr)
   }
 }
 
@@ -312,7 +327,7 @@ export const register: Register = on => {
     await setMeta($, { repo, ghError: null, configError: null, now: await now($) })
     await loadConfig($)
     p = sweep(migrate(await $.store.get(storeKey)), await now($), lingerMs())
-    nextPollAt = 0
+    requestPoll()
     await commit($, x => x)
 
     await $.tool.register({
@@ -377,7 +392,7 @@ export const register: Register = on => {
       if (who !== 'composer' && who !== 'bridge') return { text: 'only the person at the prompt can trust checks: type /ship-progress trust' }
       if (config.checks.length === 0) return { text: 'this repo configures no checks' }
       await commit($, x => ({ ...x, trust: checksDigest }))
-      nextPollAt = 0
+      requestPoll()
       const list = config.checks.map(c => `  ${c.name}: ${JSON.stringify(c.argv)}${c.env ? ` env ${JSON.stringify(Object.keys(c.env))}` : ''}`)
       return { text: [`trusted ${config.checks.length} check(s) for ${repo ?? 'this repo'}; any change to them asks again:`, ...list].join('\n') }
     }

@@ -10,6 +10,8 @@ export type Stage = {
   owner: 'mod' | 'agent'
   state: StageState
   note?: string
+  /** The agent's note from `annotate`; polling never touches it. */
+  annotation?: string
   /** What the state is about (a run id), so a repeat failure on a new run alerts again. */
   ref?: string
   url?: string

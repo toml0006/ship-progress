@@ -106,12 +106,17 @@ Hooks only change state; the clock does the polling. Every 5 s the mod checks wh
 - **Run logs** get a 20 s timeout instead of 8 s. They are large (around 150 KB), are read once per run, and are read on the clock, never in a hook.
 - **A custom `webhookEnv` name** is read with `printenv`, because the mods API reads only environment variables named as literals in the source. The default name is read directly.
 
+## Known limitations
+
+- **Two sessions in one repo** each poll the same PRs and each send alerts, so you get every alert twice, and the session that saves last wins the stored state. Fixing this needs a lease shared between sessions through the plugin store.
+- **No GIF** in this README yet.
+
 ## Development
 
 ```sh
 claude --plugin-dir /path/to/ship-progress   # load it; edits reload when a turn ends
 claude plugin validate .
-claude plugin test .                         # 48 tests, gh answered from fixtures
+claude plugin test .                         # 55 tests, gh answered from fixtures
 scripts/check-watch-only.sh && scripts/check-public.sh
 ```
 

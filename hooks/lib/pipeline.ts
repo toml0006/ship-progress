@@ -87,7 +87,11 @@ const latestRuns = (runs: readonly Run[]) => {
 export const aggregate = (entries: readonly Entry[], ref?: string): StageFact => {
   if (entries.length === 0) return { state: 'pending', note: undefined, ref }
   const failed = entries.find(e => e.phase === 'failed')
-  if (failed) return { state: 'failed', note: `${failed.name} failed`, url: failed.url, ref }
+  if (failed) {
+    // The failing job (or run), so a rerun that fails again on the same SHA is a new alert.
+    const attempt = /\/job\/(\d+)/.exec(failed.url ?? '')?.[1] ?? failed.ref
+    return { state: 'failed', note: `${failed.name} failed`, url: failed.url, ref: attempt ? `${ref ?? ''}:${attempt}` : ref }
+  }
   const running = entries.find(e => e.phase === 'running')
   if (running) return { state: 'running', url: running.url, ref }
   const cancelled = entries.find(e => e.phase === 'cancelled')
@@ -130,10 +134,16 @@ const deployedShaOf = async (ctx: Ctx, repo: string, run: Run, d: DeployConfig) 
   return sha
 }
 
+/** Longest log line the committed pattern is run on: bounds what a pathological regex can cost. */
+const MAX_LINE = 2_000
+
 export const lastMatch = (log: string, pattern: string) => {
-  const re = new RegExp(pattern, 'g')
+  const re = new RegExp(pattern)
   let sha: string | undefined
-  for (const m of log.matchAll(re)) if (m[1] && /^[0-9a-f]{7,40}$/i.test(m[1])) sha = m[1].toLowerCase()
+  for (const line of log.split('\n')) {
+    const m = re.exec(line.length > MAX_LINE ? line.slice(0, MAX_LINE) : line)
+    if (m?.[1] && /^[0-9a-f]{7,40}$/i.test(m[1])) sha = m[1].toLowerCase()
+  }
   return sha
 }
 
