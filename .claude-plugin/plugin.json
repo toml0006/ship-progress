@@ -1,0 +1,10 @@
+{
+  "name": "ship-progress",
+  "version": "0.1.0",
+  "description": "Shows above the prompt where each pull request stands on its way to production: PR CI, merged, main CI, deploys and custom checks. Watch only.",
+  "author": { "name": "Jackson Tomlinson", "url": "https://github.com/toml0006" },
+  "homepage": "https://github.com/toml0006/ship-progress",
+  "repository": "https://github.com/toml0006/ship-progress",
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}
