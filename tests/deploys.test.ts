@@ -120,6 +120,15 @@ describe('deploy stages', () => {
     expect(blind.track.stages.find(s => s.id === 'deploy:web')).toMatchObject({ state: 'warning', note: 'run 14 failed before reporting a SHA' })
   })
 
+  test('skipped runs (a workflow_run whose job did not apply) are ignored, not superseded', async () => {
+    const { track } = await poll(fresh(), [
+      ...base,
+      ['run list --workflow Deploy web (staging)', [deployRun(15, { conclusion: 'skipped' })]],
+      ['run list --workflow Deploy infra (staging)', []],
+    ])
+    expect(track.stages.find(s => s.id === 'deploy:web')!.state).toBe('pending')
+  })
+
   test('runs created before the merge are ignored, and a passed deploy is not asked again', async () => {
     const t = fresh()
     t.stages = t.stages.map(s => (s.id === 'deploy:web' ? { ...s, state: 'passed', sha: 'def5678' } : s))

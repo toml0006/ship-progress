@@ -59,7 +59,7 @@ async function loadConfig($: $) {
     config = stat ? parseConfig(await $.fs.read(configPath)) : DEFAULT_CONFIG
   } catch (err) {
     config = DEFAULT_CONFIG
-    error = `.claude/ship-progress.json: ${err instanceof Error ? err.message : String(err)}`
+    error = `${configPath.split('/').slice(-2).join('/')}: ${err instanceof Error ? err.message : String(err)}`
   }
   await setMeta($, { configError: error })
   nextPollAt = 0
@@ -213,7 +213,8 @@ export const register: Register = on => {
     const started = await next(e)
     const r = await $.session.repo()
     repo = repoFromRemote(r?.remote)
-    configPath = r ? `${r.root}/.claude/ship-progress.json` : null
+    // SHIP_PROGRESS_CONFIG points at a config outside the repo, to try one before committing it.
+    configPath = (await $.env.get('SHIP_PROGRESS_CONFIG')) || (r ? `${r.root}/.claude/ship-progress.json` : null)
     configMtime = -1
     config = DEFAULT_CONFIG
     storeKey = `repo:${repo ?? '-'}`

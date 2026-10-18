@@ -154,8 +154,8 @@ const RUN_SKEW_MS = 60_000
 
 /**
  * One deploy stage. Runs since the merge, newest first: a success whose deployed
- * SHA contains the merge passes; a failure that contains it fails; cancelled or
- * skipped runs (concurrency) are superseded and the stage keeps waiting.
+ * SHA contains the merge passes; a failure that contains it fails; a cancelled
+ * run (a concurrency group dropped it) is superseded and the stage keeps waiting.
  */
 export const deployFact = async (ctx: Ctx, repo: string, pr: PrInfo, branch: string, d: DeployConfig): Promise<StageFact> => {
   const merge = pr.mergeCommit!.oid
@@ -170,7 +170,10 @@ export const deployFact = async (ctx: Ctx, repo: string, pr: PrInfo, branch: str
       running ??= r
       continue
     }
-    if (phase === 'cancelled' || phase === 'skipped') {
+    // A skipped run is usually a workflow_run trigger whose job `if` did not apply
+    // (CI finishing on another branch): noise, not a deploy of anything.
+    if (phase === 'skipped') continue
+    if (phase === 'cancelled') {
       superseded ??= r
       continue
     }
