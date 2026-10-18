@@ -5,13 +5,14 @@ import { matchCommand } from '../hooks/lib/autotrack'
 describe('matchCommand', () => {
   test('reads the PR from the output, the argument, or the branch', () => {
     expect(matchCommand('gh pr create --fill', 'https://github.com/o/r/pull/12\n')).toEqual({ kind: 'pr', ref: 'https://github.com/o/r/pull/12' })
-    expect(matchCommand('gh pr create --web', '')).toEqual({ kind: 'branch' })
+    expect(matchCommand('gh pr create --web', '')).toEqual({ kind: 'branch', isMergedOk: false })
     expect(matchCommand('gh pr merge 608 --squash', '✓ Squashed and merged pull request o/r#608 (title)')).toEqual({ kind: 'pr', ref: 'o/r#608' })
     expect(matchCommand('gh pr merge 608 --squash --delete-branch', '')).toEqual({ kind: 'pr', ref: '608' })
     expect(matchCommand('gh pr merge --repo a/b 7 --squash', '')).toEqual({ kind: 'pr', ref: 'a/b#7' })
-    expect(matchCommand('gh pr ready', '')).toEqual({ kind: 'branch' })
-    expect(matchCommand('cd web && git push -u origin feat', '')).toEqual({ kind: 'branch' })
-    expect(matchCommand('git -C ../x push', '')).toEqual({ kind: 'branch' })
+    expect(matchCommand('gh pr ready', '')).toEqual({ kind: 'branch', isMergedOk: false })
+    expect(matchCommand('gh pr merge --squash', '')).toEqual({ kind: 'branch', isMergedOk: true })
+    expect(matchCommand('cd web && git push -u origin feat', '')).toEqual({ kind: 'branch', isMergedOk: false })
+    expect(matchCommand('git -C ../x push', '')).toEqual({ kind: 'branch', isMergedOk: false })
   })
   test('ignores what does not touch a PR', () => {
     expect(matchCommand('gh pr view 12', 'https://github.com/o/r/pull/12')).toBeUndefined()

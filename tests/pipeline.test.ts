@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import { DEFAULT_CONFIG, type Config } from '../hooks/lib/config'
-import { newTrack } from '../hooks/lib/ops'
-import { apply, gather, shapeStages, type Ctx } from '../hooks/lib/pipeline'
+import { annotate, newTrack } from '../hooks/lib/ops'
+import { apply, gather, lastMatch, shapeStages, type Ctx } from '../hooks/lib/pipeline'
 import { check, fakeGh, pr, REPO_VIEW, run } from './fixtures/fake-gh'
 
 const NOW = Date.parse('2026-10-18T10:30:00Z')
@@ -100,5 +100,27 @@ describe('pr pipeline', () => {
     t.stages.splice(2, 0, { id: 'step:smoke', label: 'smoke', owner: 'agent', state: 'pending' })
     const cfg: Config = { ...DEFAULT_CONFIG, deploys: [{ name: 'web', workflow: 'D', deployedSha: { from: 'headSha' }, timeoutMinutes: 45 }] }
     expect(shapeStages(t.stages, cfg).map(s => s.id)).toEqual(['pr-ci', 'merged', 'step:smoke', 'main-ci', 'deploy:web'])
+  })
+})
+
+describe('review fixes', () => {
+  test('a rerun that fails again on the same SHA carries a new ref, so it alerts again', async () => {
+    const job = (id: number) => ({ ...check('FAILURE', 'unit'), detailsUrl: `https://github.com/o/r/actions/runs/1/job/${id}` })
+    const a = await step([['pr view 42', pr({ statusCheckRollup: [job(100)] })], REPO_VIEW])
+    const b = await step([['pr view 42', pr({ statusCheckRollup: [job(200)] })], REPO_VIEW])
+    expect(a.track.stages[0]!.ref).toBe('head1111aaaa:100')
+    expect(b.track.stages[0]!.ref).toBe('head1111aaaa:200')
+  })
+
+  test('an annotation on a mod stage survives the next poll', async () => {
+    const t = annotate([newTrack('o/r', 42, NOW)], 'o/r#42', 'pr-ci', 'flaky: retried', NOW)[0]!
+    const { track } = await step([['pr view 42', pr({ statusCheckRollup: [check(null)] })], REPO_VIEW], t)
+    expect(track.stages[0]).toMatchObject({ state: 'running', annotation: 'flaky: retried' })
+  })
+
+  test('the deploy pattern runs per line, on lines cut to a bounded length', () => {
+    const long = 'x'.repeat(50_000)
+    expect(lastMatch(`${long}\nHEAD is now at abc1234 msg`, 'HEAD is now at (\\w+)')).toBe('abc1234')
+    expect(lastMatch(`${long}HEAD is now at abc1234`, 'HEAD is now at (\\w+)')).toBeUndefined()
   })
 })

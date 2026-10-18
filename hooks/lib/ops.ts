@@ -163,5 +163,5 @@ export const annotate = (tracks: readonly Track[], key: string, stage: string | 
   if (stage === undefined) return replaceTrack(tracks, { ...t, notes: [...t.notes, note].slice(-5), updatedAt: now })
   const s = stageOf(t, stage)
   if (!s) throw new Error(`${key} has no stage "${stage}" (stages: ${t.stages.map(x => x.id).join(', ')})`)
-  return replaceTrack(tracks, { ...t, stages: t.stages.map(x => (x === s ? { ...x, note } : x)), updatedAt: now })
+  return replaceTrack(tracks, { ...t, stages: t.stages.map(x => (x === s ? { ...x, annotation: note } : x)), updatedAt: now })
 }

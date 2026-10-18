@@ -2,8 +2,8 @@
 export type Hit =
   /** The PR is known from the command or its output. */
   | { kind: 'pr'; ref: string }
-  /** The PR is the current branch's; resolve it with `gh pr view` on a tick. */
-  | { kind: 'branch' }
+  /** The PR is the current branch's; resolve it with `gh pr view` on a tick. A push tracks only an open one. */
+  | { kind: 'branch'; isMergedOk: boolean }
 
 const PR_URL = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/
 /** `gh pr merge` prints `✓ Squashed and merged pull request owner/repo#123 (title)`. */
@@ -64,11 +64,11 @@ export const matchCommand = (command: string, output: string): Hit | undefined =
         const repo = repoFlag(args)
         return { kind: 'pr', ref: repo && /^#?\d+$/.test(arg) ? `${repo}#${arg.replace('#', '')}` : arg }
       }
-      return { kind: 'branch' }
+      return { kind: 'branch', isMergedOk: verb === 'merge' }
     }
     if (gitSubcommand(w) === 'push') {
       if (w.includes('--tags') || w.includes('--delete') || w.includes('-d')) continue
-      return { kind: 'branch' }
+      return { kind: 'branch', isMergedOk: false }
     }
   }
   return undefined
