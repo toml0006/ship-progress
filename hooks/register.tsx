@@ -5,6 +5,7 @@ import type { Meta, TaskList, Track } from '../types'
 import { INPUT_SCHEMA, parseInput, type ToolInput } from './lib/input'
 import { isShown, joinSegments, listLine, parsePr, plainLine, repoFromRemote, trackLine, type Segment } from './lib/model'
 import { osascriptArgv, transitions, type Alert } from './lib/alerts'
+import { matchCommand, type Hit } from './lib/autotrack'
 import { checksHash } from './lib/checks'
 import { DEFAULT_CONFIG, parseConfig, type Config } from './lib/config'
 import { GhError, type Runner } from './lib/gh'
@@ -43,6 +44,9 @@ const checkLastRun: Record<string, number> = {}
 let isDarwin: boolean | undefined
 let isSlackNoteLogged = false
 const DEFAULT_WEBHOOK_ENV = 'SHIP_PROGRESS_SLACK_WEBHOOK'
+
+/** Directories where a `git push` or a `gh pr` command ran; their branch's PR is looked up on the next tick. */
+const branchLookups = new Set<string>()
 
 // Polling: when the next poll is due, the interval after a gh error, and the round-robin cursor.
 let nextPollAt = 0
@@ -104,6 +108,7 @@ async function tick($: $) {
   // Redraw elapsed times only while something is on the bar.
   if (shown) await setMeta($, { now: t })
   await loadConfig($)
+  if (branchLookups.size && !isPolling) await resolveBranches($)
   if (t >= nextPollAt && !isPolling) {
     isPolling = true
     try {
@@ -181,6 +186,31 @@ async function sendAlert($: $, a: Alert, cfg: Config) {
     const text = a.url ? `ship-progress: ${a.text} <${a.url}|open>` : `ship-progress: ${a.text}`
     const res = await $.http.fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text }) }).catch(() => undefined)
     if (!res?.ok) $.ui.log(`ship-progress: slack webhook POST failed (status ${res?.status ?? 'none'})`, { to: 'debug' })
+  }
+}
+
+/** A Bash call named a PR, or pushed a branch: track it now, or look the branch's PR up on a tick. */
+async function noteHit($: $, hit: Hit) {
+  if (hit.kind === 'pr') {
+    await startTrack($, hit.ref).catch(() => undefined)
+    return
+  }
+  branchLookups.add(await $.session.cwd())
+}
+
+/** Looks up the current branch's PR where a push ran; tracks it when it is open or just merged. */
+async function resolveBranches($: $) {
+  const dirs = [...branchLookups]
+  branchLookups.clear()
+  for (const cwd of dirs) {
+    const out = await $.process.run(['gh', 'pr', 'view', '--json', 'url,state'], { cwd, timeoutMs: GH_TIMEOUT_MS }).catch(() => undefined)
+    if (out?.exitCode !== 0) continue // no PR for this branch
+    try {
+      const pr = JSON.parse(out.stdout) as { url: string; state: string }
+      if (pr.state === 'OPEN' || pr.state === 'MERGED') await startTrack($, pr.url)
+    } catch {
+      // unreadable output: nothing to track
+    }
   }
 }
 
@@ -297,6 +327,16 @@ export const register: Register = on => {
     $.clock.every(TICK_MS, () => void tick($).catch(err => $.ui.log(`ship-progress tick failed: ${String(err)}`, { to: 'debug' })))
     return started
   })
+
+  // Auto-tracking: read each Bash call after it ran. Parsing only; gh lookups wait for a tick.
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    const r = await next(e)
+    if (r.deny === undefined && !r.isError) {
+      const hit = matchCommand(e.command, r.text ?? '')
+      if (hit) await noteHit($, hit)
+    }
+    return r
+  }).catch(($, e, next) => next(e))
 
   on('tool.call', { tool: TOOL }, async ($, e) => {
     try {
