@@ -7,6 +7,9 @@ export const LOG_TIMEOUT_MS = 20_000
 /** A `gh` failure, with a message short enough for the bar. */
 export class GhError extends Error {}
 
+/** The config names a workflow GitHub does not have (yet): a config problem for one stage, not an outage. */
+export class MissingWorkflow extends GhError {}
+
 const firstLine = (text: string) => (text.split('\n').find(l => l.trim()) ?? '').trim().slice(0, 80)
 
 export const gh = async (run: Runner, args: readonly string[], opts?: { timeoutMs?: number }): Promise<string> => {
@@ -73,14 +76,20 @@ export const prView = (run: Runner, repo: string, number: number) =>
   json<PrInfo>(run, ['pr', 'view', String(number), '--repo', repo, '--json', PR_FIELDS])
 
 /** Runs, newest first, filtered by `--workflow`, `--commit`, `--branch`, `--event` as given. */
-export const runList = (run: Runner, repo: string, filter: { workflow?: string; commit?: string; branch?: string; event?: string; limit?: number }) =>
-  json<Run[]>(run, [
-    'run', 'list', '--repo', repo, '--json', RUN_FIELDS, '--limit', String(filter.limit ?? 20),
-    ...(filter.workflow ? ['--workflow', filter.workflow] : []),
-    ...(filter.commit ? ['--commit', filter.commit] : []),
-    ...(filter.branch ? ['--branch', filter.branch] : []),
-    ...(filter.event ? ['--event', filter.event] : []),
-  ])
+export const runList = async (run: Runner, repo: string, filter: { workflow?: string; commit?: string; branch?: string; event?: string; limit?: number }) => {
+  try {
+    return await json<Run[]>(run, [
+      'run', 'list', '--repo', repo, '--json', RUN_FIELDS, '--limit', String(filter.limit ?? 20),
+      ...(filter.workflow ? ['--workflow', filter.workflow] : []),
+      ...(filter.commit ? ['--commit', filter.commit] : []),
+      ...(filter.branch ? ['--branch', filter.branch] : []),
+      ...(filter.event ? ['--event', filter.event] : []),
+    ])
+  } catch (err) {
+    if (err instanceof GhError && /could not find any workflows/i.test(err.message)) throw new MissingWorkflow(`no workflow "${filter.workflow}" on GitHub`)
+    throw err
+  }
+}
 
 export const defaultBranch = async (run: Runner, repo: string) =>
   (await json<{ defaultBranchRef: { name: string } }>(run, ['repo', 'view', repo, '--json', 'defaultBranchRef'])).defaultBranchRef.name

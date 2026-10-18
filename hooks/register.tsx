@@ -133,30 +133,33 @@ async function poll($: $, t: number) {
   cursor = (cursor + batch.length) % Math.max(1, active.length)
   const run = runner($)
   const cache = { logShas: { ...p.logShas }, contains: { ...p.contains } }
-  try {
-    for (const track of batch) {
-      const cfg = configFor(track.repo)
-      const checks = track.repo === repo && repoRoot ? { isTrusted: p.trust === checksDigest, cwd: repoRoot, lastRun: checkLastRun } : undefined
-      const facts = await gather(track, { run, config: cfg, now: t, defaultBranches, localRepo: repo, cache, checks })
-      let alerts: Alert[] = []
-      await commit($, x => {
-        const tracks = x.tracks.map(y => {
-          if (y.key !== track.key) return y
-          const next = apply(y, facts, cfg, t)
-          alerts = transitions(y, next, cfg.notify, repo).filter(a => !x.alerts.includes(a.key))
-          return next
-        })
-        return { ...x, tracks, logShas: cache.logShas, contains: cache.contains, alerts: [...x.alerts, ...alerts.map(a => a.key)] }
-      })
-      for (const a of alerts) void sendAlert($, a, cfg).catch(err => $.ui.log(`ship-progress alert failed: ${err instanceof Error ? err.message : 'error'}`, { to: 'debug' }))
+  // One PR's gh failure does not stop the others; any failure backs the next poll off.
+  let failure: string | null = null
+  for (const track of batch) {
+    const cfg = configFor(track.repo)
+    const checks = track.repo === repo && repoRoot ? { isTrusted: p.trust === checksDigest, cwd: repoRoot, lastRun: checkLastRun } : undefined
+    let facts
+    try {
+      facts = await gather(track, { run, config: cfg, now: t, defaultBranches, localRepo: repo, cache, checks })
+    } catch (err) {
+      if (!(err instanceof GhError)) throw err
+      failure = err.message
+      continue
     }
-    backoffMs = 0
-    await setMeta($, { ghError: null })
-  } catch (err) {
-    if (!(err instanceof GhError)) throw err
-    backoffMs = Math.min(MAX_BACKOFF_MS, Math.max(RUNNING_MS, backoffMs) * 2)
-    await setMeta($, { ghError: err.message })
+    let alerts: Alert[] = []
+    await commit($, x => {
+      const tracks = x.tracks.map(y => {
+        if (y.key !== track.key) return y
+        const next = apply(y, facts, cfg, t)
+        alerts = transitions(y, next, cfg.notify, repo).filter(a => !x.alerts.includes(a.key))
+        return next
+      })
+      return { ...x, tracks, logShas: cache.logShas, contains: cache.contains, alerts: [...x.alerts, ...alerts.map(a => a.key)] }
+    })
+    for (const a of alerts) void sendAlert($, a, cfg).catch(err => $.ui.log(`ship-progress alert failed: ${err instanceof Error ? err.message : 'error'}`, { to: 'debug' }))
   }
+  backoffMs = failure ? Math.min(MAX_BACKOFF_MS, Math.max(RUNNING_MS, backoffMs) * 2) : 0
+  await setMeta($, { ghError: failure })
   const isRunning = p.tracks.some(x => x.status === 'active' && x.stages.some(s => s.state === 'running'))
   nextPollAt = t + (backoffMs || (isRunning ? RUNNING_MS : PENDING_MS))
 }
