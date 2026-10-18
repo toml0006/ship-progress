@@ -4,6 +4,7 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { Meta, TaskList, Track } from '../types'
 import { INPUT_SCHEMA, parseInput, type ToolInput } from './lib/input'
 import { isShown, joinSegments, listLine, parsePr, plainLine, repoFromRemote, trackLine, type Segment } from './lib/model'
+import { osascriptArgv, transitions, type Alert } from './lib/alerts'
 import { checksHash } from './lib/checks'
 import { DEFAULT_CONFIG, parseConfig, type Config } from './lib/config'
 import { GhError, type Runner } from './lib/gh'
@@ -37,6 +38,11 @@ let configMtime = -1
 let checksDigest = ''
 let repoRoot: string | null = null
 const checkLastRun: Record<string, number> = {}
+
+// Alerts: whether this host is macOS (asked once), and whether the missing-webhook note was logged.
+let isDarwin: boolean | undefined
+let isSlackNoteLogged = false
+const DEFAULT_WEBHOOK_ENV = 'SHIP_PROGRESS_SLACK_WEBHOOK'
 
 // Polling: when the next poll is due, the interval after a gh error, and the round-robin cursor.
 let nextPollAt = 0
@@ -124,7 +130,17 @@ async function poll($: $, t: number) {
       const cfg = configFor(track.repo)
       const checks = track.repo === repo && repoRoot ? { isTrusted: p.trust === checksDigest, cwd: repoRoot, lastRun: checkLastRun } : undefined
       const facts = await gather(track, { run, config: cfg, now: t, defaultBranches, localRepo: repo, cache, checks })
-      await commit($, x => ({ ...x, logShas: cache.logShas, contains: cache.contains, tracks: x.tracks.map(y => (y.key === track.key ? apply(y, facts, cfg, t) : y)) }))
+      let alerts: Alert[] = []
+      await commit($, x => {
+        const tracks = x.tracks.map(y => {
+          if (y.key !== track.key) return y
+          const next = apply(y, facts, cfg, t)
+          alerts = transitions(y, next, cfg.notify, repo).filter(a => !x.alerts.includes(a.key))
+          return next
+        })
+        return { ...x, tracks, logShas: cache.logShas, contains: cache.contains, alerts: [...x.alerts, ...alerts.map(a => a.key)] }
+      })
+      for (const a of alerts) void sendAlert($, a, cfg).catch(err => $.ui.log(`ship-progress alert failed: ${err instanceof Error ? err.message : 'error'}`, { to: 'debug' }))
     }
     backoffMs = 0
     await setMeta($, { ghError: null })
@@ -135,6 +151,37 @@ async function poll($: $, t: number) {
   }
   const isRunning = p.tracks.some(x => x.status === 'active' && x.stages.some(s => s.state === 'running'))
   nextPollAt = t + (backoffMs || (isRunning ? RUNNING_MS : PENDING_MS))
+}
+
+/** The webhook URL from the environment variable the config names. Never stored, logged or shown. */
+async function webhookUrl($: $, name: string) {
+  if (name === DEFAULT_WEBHOOK_ENV) return $.env.get('SHIP_PROGRESS_SLACK_WEBHOOK')
+  // $.env.get takes literal names only; a custom name is read from a child's environment.
+  const out = await $.process.run(['printenv', name], { timeoutMs: 2_000 }).catch(() => undefined)
+  return out?.exitCode === 0 ? out.stdout.trim() || undefined : undefined
+}
+
+/** Wakes the agent, raises a macOS banner and posts to Slack, as the config allows. */
+async function sendAlert($: $, a: Alert, cfg: Config) {
+  const line = `${a.text}${a.url ? ` ${a.url}` : ''}`
+  if (cfg.notify.wakeAgent) {
+    void $.prompt.submit({ text: `ship-progress: ${line}\n(Watch only: the mod changed nothing. Decide whether to act.)` }).catch(() => undefined)
+  }
+  if (cfg.notify.macos) {
+    isDarwin ??= (await $.process.run(['uname', '-s'], { timeoutMs: 2_000 }).catch(() => undefined))?.stdout.trim() === 'Darwin'
+    if (isDarwin) await $.process.run(osascriptArgv(a.text), { timeoutMs: 5_000 }).catch(() => undefined)
+  }
+  if (cfg.notify.slack) {
+    const url = await webhookUrl($, cfg.notify.slack.webhookEnv)
+    if (!url) {
+      if (!isSlackNoteLogged) $.ui.log(`ship-progress: ${cfg.notify.slack.webhookEnv} is not set; Slack alerts are off`, { to: 'debug' })
+      isSlackNoteLogged = true
+      return
+    }
+    const text = a.url ? `ship-progress: ${a.text} <${a.url}|open>` : `ship-progress: ${a.text}`
+    const res = await $.http.fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text }) }).catch(() => undefined)
+    if (!res?.ok) $.ui.log(`ship-progress: slack webhook POST failed (status ${res?.status ?? 'none'})`, { to: 'debug' })
+  }
 }
 
 /** Starts following a PR; the next tick polls it. */
