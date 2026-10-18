@@ -9,6 +9,8 @@ A Claude Code mod that shows, above the prompt, where each pull request stands o
 #605 ✕□□□□  PR CI failed 2m 41f0e2aa ⚠ CI / unit failed
 ```
 
+![A live session: PRs tracked above the prompt, one opened by the agent and followed through CI](docs/demo.gif)
+
 It follows each PR through **PR CI → merged → main CI → deploys → custom checks**. It polls `gh` on a timer, so the agent doesn't spend turns watching CI, and it alerts when a stage fails or a PR goes live: it wakes the agent, raises a macOS notification, and posts to Slack if you configure a webhook.
 
 **It only watches.** It never merges, reruns, retargets, cancels, approves or pushes. A CI guard (`scripts/check-watch-only.sh`) fails the build if its source ever names such a command.
@@ -109,7 +111,6 @@ Hooks only change state; the clock does the polling. Every 5 s the mod checks wh
 ## Known limitations
 
 - **Two sessions in one repo** each poll the same PRs and each send alerts, so you get every alert twice, and the session that saves last wins the stored state. Fixing this needs a lease shared between sessions through the plugin store.
-- **No GIF** in this README yet.
 
 ## Development
 
