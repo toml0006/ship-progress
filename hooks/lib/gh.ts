@@ -1,15 +1,18 @@
 /** Runs a command by argv (no shell). The mod's runner is `$.process.run`; tests pass fixtures. */
-export type Runner = (argv: readonly string[]) => Promise<{ exitCode: number; stdout: string; stderr: string }>
+export type Runner = (argv: readonly string[], opts?: { timeoutMs?: number }) => Promise<{ exitCode: number; stdout: string; stderr: string }>
+
+/** A run's log can be large; it gets longer than an ordinary gh call. */
+export const LOG_TIMEOUT_MS = 20_000
 
 /** A `gh` failure, with a message short enough for the bar. */
 export class GhError extends Error {}
 
 const firstLine = (text: string) => (text.split('\n').find(l => l.trim()) ?? '').trim().slice(0, 80)
 
-export const gh = async (run: Runner, args: readonly string[]): Promise<string> => {
+export const gh = async (run: Runner, args: readonly string[], opts?: { timeoutMs?: number }): Promise<string> => {
   let out
   try {
-    out = await run(['gh', ...args])
+    out = await run(['gh', ...args], opts)
   } catch (err) {
     throw new GhError(/time/i.test(String(err)) ? 'timed out' : firstLine(String(err)) || 'could not run gh')
   }
@@ -87,7 +90,7 @@ export const branchPrMerged = async (run: Runner, repo: string, branch: string) 
   (await json<unknown[]>(run, ['pr', 'list', '--repo', repo, '--head', branch, '--state', 'merged', '--json', 'number', '--limit', '1'])).length > 0
 
 /** The text of a completed run's log. Large; read once per run and cache what it yields. */
-export const runLog = (run: Runner, repo: string, id: string) => gh(run, ['run', 'view', id, '--repo', repo, '--log'])
+export const runLog = (run: Runner, repo: string, id: string) => gh(run, ['run', 'view', id, '--repo', repo, '--log'], { timeoutMs: LOG_TIMEOUT_MS })
 
 /** Whether `ancestor` is contained in `sha`, by the compare API (`ahead` or `identical`). */
 export const compareContains = async (run: Runner, repo: string, ancestor: string, sha: string) => {

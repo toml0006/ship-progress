@@ -10,6 +10,7 @@ const BAND = { plugin: 'ship-progress', component: 'AbovePrompt', props: { hasSu
 const world = (on: On, store: Record<string, unknown> = {}) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   mock.store(on, store)
+  mock.env(on, {})
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.repo', () => ({ value: { root: '/r', remote: 'git@github.com:o/r.git', internal: false, name: null } }))
   on('tool.register', ($, e) => ({ value: { tool: `mcp__ship-progress__${e.name}` } }))

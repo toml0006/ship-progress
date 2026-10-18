@@ -1,6 +1,6 @@
 import type { Stage, StageState, Track } from '../../types'
-import type { Config } from './config'
-import { branchPrMerged, defaultBranch, prView, runList, type PrInfo, type RollupItem, type Run, type Runner } from './gh'
+import type { Config, DeployConfig } from './config'
+import { branchPrMerged, compareContains, defaultBranch, prView, runList, runLog, type PrInfo, type RollupItem, type Run, type Runner } from './gh'
 import { currentStage, isSettled, moveStage } from './model'
 
 /** What GitHub says about one stage, before it is folded into the track. */
@@ -24,6 +24,10 @@ export type Ctx = {
   now: number
   /** Default branch by repo, filled on first use. */
   defaultBranches: Map<string, string>
+  /** The session's repo: containment is asked of the local clone first for this one. */
+  localRepo?: string | null
+  /** Read and filled while gathering; the caller persists them. */
+  cache: { logShas: Record<string, string>; contains: Record<string, boolean> }
 }
 
 /** How long after a merge, with no CI config and no push run, main CI counts as absent. */
@@ -111,8 +115,86 @@ const mainCiFact = async (ctx: Ctx, repo: string, pr: PrInfo, branch: string): P
   return aggregate(runs.map(runEntry), sha)
 }
 
+/** The SHA a completed run deployed: its headSha, or the last pattern match in its log (read once, cached). */
+const deployedShaOf = async (ctx: Ctx, repo: string, run: Run, d: DeployConfig) => {
+  if (d.deployedSha.from === 'headSha') return run.headSha
+  const id = String(run.databaseId)
+  if (id in ctx.cache.logShas) return ctx.cache.logShas[id] || undefined
+  const sha = lastMatch(await runLog(ctx.run, repo, id), d.deployedSha.pattern)
+  ctx.cache.logShas[id] = sha ?? ''
+  return sha
+}
+
+export const lastMatch = (log: string, pattern: string) => {
+  const re = new RegExp(pattern, 'g')
+  let sha: string | undefined
+  for (const m of log.matchAll(re)) if (m[1] && /^[0-9a-f]{7,40}$/i.test(m[1])) sha = m[1].toLowerCase()
+  return sha
+}
+
+/** Whether `deployed` contains `merge`: the local clone first, then the compare API. Cached. */
+export const contains = async (ctx: Ctx, repo: string, merge: string, deployed: string) => {
+  if (merge.startsWith(deployed) || deployed.startsWith(merge)) return true
+  const key = `${merge}:${deployed}`
+  if (key in ctx.cache.contains) return ctx.cache.contains[key]!
+  let answer: boolean | undefined
+  if (ctx.localRepo === repo) {
+    const out = await ctx.run(['git', 'merge-base', '--is-ancestor', merge, deployed]).catch(() => undefined)
+    // 0: ancestor; 1: not; anything else (a commit this clone has not fetched): ask GitHub.
+    if (out?.exitCode === 0) answer = true
+    else if (out?.exitCode === 1) answer = false
+  }
+  answer ??= await compareContains(ctx.run, repo, merge, deployed)
+  ctx.cache.contains[key] = answer
+  return answer
+}
+
+/** Slack between a merge and the deploy run it triggers, for clock skew. */
+const RUN_SKEW_MS = 60_000
+
+/**
+ * One deploy stage. Runs since the merge, newest first: a success whose deployed
+ * SHA contains the merge passes; a failure that contains it fails; a cancelled
+ * run (a concurrency group dropped it) is superseded and the stage keeps waiting.
+ */
+export const deployFact = async (ctx: Ctx, repo: string, pr: PrInfo, branch: string, d: DeployConfig): Promise<StageFact> => {
+  const merge = pr.mergeCommit!.oid
+  const since = (pr.mergedAt ? Date.parse(pr.mergedAt) : 0) - RUN_SKEW_MS
+  const runs = (await runList(ctx.run, repo, { workflow: d.workflow, branch: d.branch ?? branch, limit: 20 })).filter(r => Date.parse(r.createdAt) >= since)
+  let running: Run | undefined
+  let superseded: Run | undefined
+  let unreadable: Run | undefined
+  for (const r of runs) {
+    const phase = runPhase(r)
+    if (phase === 'running') {
+      running ??= r
+      continue
+    }
+    // A skipped run is usually a workflow_run trigger whose job `if` did not apply
+    // (CI finishing on another branch): noise, not a deploy of anything.
+    if (phase === 'skipped') continue
+    if (phase === 'cancelled') {
+      superseded ??= r
+      continue
+    }
+    const sha = await deployedShaOf(ctx, repo, r, d)
+    if (!sha) {
+      if (phase === 'failed') unreadable ??= r
+      continue
+    }
+    if (!(await contains(ctx, repo, merge, sha))) continue
+    const ref = String(r.databaseId)
+    if (phase === 'passed') return { state: 'passed', deployedSha: sha, ref, url: r.url }
+    return { state: 'failed', note: `run ${ref} failed`, deployedSha: sha, ref, url: r.url }
+  }
+  if (running) return { state: 'running', ref: String(running.databaseId), url: running.url }
+  if (superseded) return { state: 'superseded', note: `run ${superseded.databaseId} ${superseded.conclusion}; waiting for a later run`, ref: String(superseded.databaseId), url: superseded.url }
+  if (unreadable) return { state: 'warning', note: `run ${unreadable.databaseId} failed before reporting a SHA`, ref: String(unreadable.databaseId), url: unreadable.url }
+  return { state: 'pending' }
+}
+
 /** Asks GitHub about one track. Throws GhError when gh fails; the caller backs off. */
-export const gather = async (track: Track, ctx: Ctx, deploys?: (pr: PrInfo, branch: string) => Promise<Record<string, StageFact>>): Promise<Facts> => {
+export const gather = async (track: Track, ctx: Ctx): Promise<Facts> => {
   const pr = await prView(ctx.run, track.repo, track.number)
   let branch = ctx.defaultBranches.get(track.repo)
   if (!branch) {
@@ -123,7 +205,13 @@ export const gather = async (track: Track, ctx: Ctx, deploys?: (pr: PrInfo, bran
   const facts: Facts = { pr, defaultBranch: branch, baseMerged, prCi: await prCiFact(ctx, track.repo, pr), deploys: {} }
   if (pr.state === 'MERGED' && pr.mergeCommit) {
     facts.mainCi = await mainCiFact(ctx, track.repo, pr, branch)
-    if (facts.mainCi.state === 'passed' || facts.mainCi.state === 'skipped') facts.deploys = (await deploys?.(pr, branch)) ?? {}
+    if (facts.mainCi.state === 'passed' || facts.mainCi.state === 'skipped') {
+      for (const d of ctx.config.deploys) {
+        // A deploy that passed stays passed: later runs ship later commits.
+        if (track.stages.some(s => s.id === `deploy:${d.name}` && s.state === 'passed')) continue
+        facts.deploys[d.name] = await deployFact(ctx, track.repo, pr, branch, d)
+      }
+    }
   }
   return facts
 }
@@ -167,9 +255,20 @@ const factFor = (stage: Stage, f: Facts, branch: string): StageFact | undefined 
     case 'main-ci':
       return f.mainCi ?? { state: 'pending' }
     default:
-      if (stage.id.startsWith('deploy:')) return f.deploys[stage.label] ?? { state: 'pending' }
+      if (stage.id.startsWith('deploy:')) {
+        if (stage.state === 'passed') return undefined
+        return f.deploys[stage.label] ?? { state: 'pending' }
+      }
       return undefined
   }
+}
+
+/** A deploy that has waited past its timeout without passing or failing fails. */
+const timedOut = (s: Stage, config: Config, now: number): Stage | undefined => {
+  if (!s.id.startsWith('deploy:') || isSettled(s.state) || s.state === 'failed' || s.startedAt === undefined) return undefined
+  const d = config.deploys.find(x => `deploy:${x.name}` === s.id)
+  if (!d || now - s.startedAt < d.timeoutMinutes * 60_000) return undefined
+  return moveStage(s, 'failed', now, { note: `no deploy within ${d.timeoutMinutes} min${s.note ? ` (${s.note})` : ''}` })
 }
 
 /** Folds facts into a track: stage states, SHAs, and whether it is done or closed. Pure. */
@@ -177,14 +276,15 @@ export const apply = (track: Track, f: Facts, config: Config, now: number): Trac
   const stages = shapeStages(track.stages, config).map(s => {
     const fact = s.owner === 'mod' ? factFor(s, f, f.defaultBranch) : undefined
     if (!fact) return s
-    const { state, deployedSha: _, ...extra } = fact
-    return moveStage(s, state, now, { note: undefined, ref: undefined, url: undefined, ...extra })
+    const { state, deployedSha, ...extra } = fact
+    const next = moveStage(s, state, now, { note: undefined, ref: undefined, url: undefined, sha: deployedSha, ...extra })
+    return timedOut(next, config, now) ?? next
   })
   // The stage being waited on shows how long it has waited.
   const current = currentStage(stages)
   if (current && current.startedAt === undefined) stages[stages.indexOf(current)] = { ...current, startedAt: now }
 
-  const deployed = config.deploys.map(d => f.deploys[d.name]?.deployedSha).filter(Boolean).at(-1)
+  const deployed = stages.filter(s => s.id.startsWith('deploy:') && s.sha).at(-1)?.sha
   const next: Track = {
     ...track,
     title: f.pr.title,
