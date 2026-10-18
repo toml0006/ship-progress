@@ -3,7 +3,7 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { Meta, TaskList, Track } from '../types'
 import { INPUT_SCHEMA, parseInput, type ToolInput } from './lib/input'
-import { isShown, joinSegments, listLine, parsePr, plainLine, repoFromRemote, trackLine, type Segment } from './lib/model'
+import { joinSegments, listLine, parsePr, plainLine, repoFromRemote, trackLine, type Segment } from './lib/model'
 import { osascriptArgv, transitions, type Alert } from './lib/alerts'
 import { matchCommand, type Hit } from './lib/autotrack'
 import { checksHash } from './lib/checks'
@@ -55,6 +55,8 @@ let cursor = 0
 let isPolling = false
 const defaultBranches = new Map<string, string>()
 
+const lingerMs = () => config.doneLingerMinutes * 60_000
+
 /** Config applies to the session's own repo; tracks in other repos get the defaults. */
 const configFor = (r: string) => (r === repo ? config : DEFAULT_CONFIG)
 
@@ -102,8 +104,9 @@ function setMeta($: $, patch: Partial<Meta>) {
 
 async function tick($: $) {
   const t = await now($)
-  const shown = p.tracks.some(x => isShown(x, t)) || p.lists.some(x => isShown(x, t))
-  const swept = sweep(p, t)
+  // Everything still in p is in flight or lingering: the sweep drops the rest.
+  const shown = p.tracks.length > 0 || p.lists.length > 0
+  const swept = sweep(p, t, lingerMs())
   if (swept.tracks.length !== p.tracks.length || swept.lists.length !== p.lists.length) await commit($, () => swept)
   // Redraw elapsed times only while something is on the bar.
   if (shown) await setMeta($, { now: t })
@@ -130,30 +133,33 @@ async function poll($: $, t: number) {
   cursor = (cursor + batch.length) % Math.max(1, active.length)
   const run = runner($)
   const cache = { logShas: { ...p.logShas }, contains: { ...p.contains } }
-  try {
-    for (const track of batch) {
-      const cfg = configFor(track.repo)
-      const checks = track.repo === repo && repoRoot ? { isTrusted: p.trust === checksDigest, cwd: repoRoot, lastRun: checkLastRun } : undefined
-      const facts = await gather(track, { run, config: cfg, now: t, defaultBranches, localRepo: repo, cache, checks })
-      let alerts: Alert[] = []
-      await commit($, x => {
-        const tracks = x.tracks.map(y => {
-          if (y.key !== track.key) return y
-          const next = apply(y, facts, cfg, t)
-          alerts = transitions(y, next, cfg.notify, repo).filter(a => !x.alerts.includes(a.key))
-          return next
-        })
-        return { ...x, tracks, logShas: cache.logShas, contains: cache.contains, alerts: [...x.alerts, ...alerts.map(a => a.key)] }
-      })
-      for (const a of alerts) void sendAlert($, a, cfg).catch(err => $.ui.log(`ship-progress alert failed: ${err instanceof Error ? err.message : 'error'}`, { to: 'debug' }))
+  // One PR's gh failure does not stop the others; any failure backs the next poll off.
+  let failure: string | null = null
+  for (const track of batch) {
+    const cfg = configFor(track.repo)
+    const checks = track.repo === repo && repoRoot ? { isTrusted: p.trust === checksDigest, cwd: repoRoot, lastRun: checkLastRun } : undefined
+    let facts
+    try {
+      facts = await gather(track, { run, config: cfg, now: t, defaultBranches, localRepo: repo, cache, checks })
+    } catch (err) {
+      if (!(err instanceof GhError)) throw err
+      failure = err.message
+      continue
     }
-    backoffMs = 0
-    await setMeta($, { ghError: null })
-  } catch (err) {
-    if (!(err instanceof GhError)) throw err
-    backoffMs = Math.min(MAX_BACKOFF_MS, Math.max(RUNNING_MS, backoffMs) * 2)
-    await setMeta($, { ghError: err.message })
+    let alerts: Alert[] = []
+    await commit($, x => {
+      const tracks = x.tracks.map(y => {
+        if (y.key !== track.key) return y
+        const next = apply(y, facts, cfg, t)
+        alerts = transitions(y, next, cfg.notify, repo).filter(a => !x.alerts.includes(a.key))
+        return next
+      })
+      return { ...x, tracks, logShas: cache.logShas, contains: cache.contains, alerts: [...x.alerts, ...alerts.map(a => a.key)] }
+    })
+    for (const a of alerts) void sendAlert($, a, cfg).catch(err => $.ui.log(`ship-progress alert failed: ${err instanceof Error ? err.message : 'error'}`, { to: 'debug' }))
   }
+  backoffMs = failure ? Math.min(MAX_BACKOFF_MS, Math.max(RUNNING_MS, backoffMs) * 2) : 0
+  await setMeta($, { ghError: failure })
   const isRunning = p.tracks.some(x => x.status === 'active' && x.stages.some(s => s.state === 'running'))
   nextPollAt = t + (backoffMs || (isRunning ? RUNNING_MS : PENDING_MS))
 }
@@ -303,11 +309,11 @@ export const register: Register = on => {
     configMtime = -1
     config = DEFAULT_CONFIG
     storeKey = `repo:${repo ?? '-'}`
-    p = sweep(migrate(await $.store.get(storeKey)), await now($))
-    nextPollAt = 0
-    await commit($, x => x)
     await setMeta($, { repo, ghError: null, configError: null, now: await now($) })
     await loadConfig($)
+    p = sweep(migrate(await $.store.get(storeKey)), await now($), lingerMs())
+    nextPollAt = 0
+    await commit($, x => x)
 
     await $.tool.register({
       name: 'ship_progress',
@@ -391,8 +397,8 @@ export const register: Register = on => {
     if (e.props.hasSurvey) return next(e)
     const t = meta.now
     const items: { at: number; line: Segment[] }[] = [
-      ...tracks.filter((x: Track) => isShown(x, t)).map((x: Track) => ({ at: x.updatedAt, line: trackLine(x, t, meta.repo) })),
-      ...lists.filter((x: TaskList) => isShown(x, t)).map((x: TaskList) => ({ at: x.updatedAt, line: listLine(x, t) })),
+      ...tracks.map((x: Track) => ({ at: x.updatedAt, line: trackLine(x, t, meta.repo) })),
+      ...lists.map((x: TaskList) => ({ at: x.updatedAt, line: listLine(x, t) })),
     ].sort((a, b) => b.at - a.at)
     if (items.length === 0) return next(e)
 

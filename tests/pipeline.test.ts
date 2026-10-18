@@ -83,6 +83,13 @@ describe('pr pipeline', () => {
     expect(track.stages[2]).toMatchObject({ state: 'skipped', note: 'no CI ran on main' })
   })
 
+  test('a configured workflow GitHub lacks is a warning on that stage, not a gh outage', async () => {
+    const cfg: Config = { ...DEFAULT_CONFIG, ci: { workflow: 'CI' } }
+    const { track } = await step([['pr view 42', MERGED], REPO_VIEW, ['run list --workflow CI', new Error('could not find any workflows named CI')]], newTrack('o/r', 42, NOW), cfg)
+    expect(track.stages[0]!.state).toBe('passed') // PR CI by name comes from the rollup, with no run list
+    expect(track.stages[2]).toMatchObject({ state: 'warning', note: 'no workflow "CI" on GitHub' })
+  })
+
   test('gh failures surface as a short GhError', async () => {
     const gh = fakeGh([['pr view', new Error('HTTP 403: API rate limit exceeded for user\nmore')]])
     await expect(gather(newTrack('o/r', 42, NOW), ctx(gh))).rejects.toThrow('HTTP 403: API rate limit exceeded for user')

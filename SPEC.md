@@ -9,7 +9,7 @@
 
 It exists because watching PRs by hand costs a lot of agent turns and attention: polling `gh run list`, finding the right deploy run, reading its log to see which commit actually shipped, checking that workers drained. The mod does that polling itself, at no token cost, and wakes the agent only when something changes.
 
-Status: **spec only.** No code yet. This document is the brief for the implementing agent.
+Status: **implemented** (v0.1.0); see the README for use. This document is the design brief the implementation follows; the README notes where it deviates.
 
 ## 1. Goals and non-goals
 

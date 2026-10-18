@@ -9,10 +9,6 @@ export const isSettled = (state: StageState) => state === 'passed' || state === 
 export const currentStage = (stages: readonly Stage[]): Stage | undefined =>
   stages.find(s => !isSettled(s.state))
 
-/** Whether a track or list belongs on the bar: active, or ended less than `lingerMs` ago. */
-export const isShown = (item: Track | TaskList, now: number, lingerMs = DEFAULT_LINGER_MS) =>
-  item.endedAt === undefined || now - item.endedAt < lingerMs
-
 export const PIPS: Record<StageState, string> = {
   passed: '■',
   skipped: '↷',

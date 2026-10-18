@@ -1,7 +1,7 @@
 import type { Stage, StageState, Track } from '../../types'
 import { runCheck } from './checks'
 import type { Config, DeployConfig } from './config'
-import { branchPrMerged, compareContains, defaultBranch, prView, runList, runLog, type PrInfo, type RollupItem, type Run, type Runner } from './gh'
+import { branchPrMerged, compareContains, defaultBranch, MissingWorkflow, prView, runList, runLog, type PrInfo, type RollupItem, type Run, type Runner } from './gh'
 import { currentStage, isSettled, moveStage } from './model'
 
 /** What GitHub says about one stage, before it is folded into the track. */
@@ -100,8 +100,8 @@ const prCiFact = async (ctx: Ctx, repo: string, pr: PrInfo): Promise<StageFact> 
   const wf = ctx.config.ci?.workflow
   if (!wf) return aggregate(rollup.map(rollupEntry), pr.headRefOid)
   const named = rollup.filter(i => i.workflowName === wf)
-  if (named.length) return aggregate(named.map(rollupEntry), pr.headRefOid)
-  // A workflow given by file name, or not reported in the rollup: ask for its runs on the head SHA.
+  // The rollup names workflows; one given by file name is asked for by its runs on the head SHA.
+  if (named.length || !/\.ya?ml$/.test(wf)) return aggregate(named.map(rollupEntry), pr.headRefOid)
   const runs = await runList(ctx.run, repo, { workflow: wf, commit: pr.headRefOid, limit: 5 })
   return aggregate(runs.slice(0, 1).map(runEntry), pr.headRefOid)
 }
@@ -223,6 +223,13 @@ const checkFacts = async (ctx: Ctx, track: Track, f: Facts): Promise<Record<stri
   return out
 }
 
+/** A workflow the config names but GitHub lacks is a warning on that stage alone. */
+const orMissing = (fact: Promise<StageFact>): Promise<StageFact> =>
+  fact.catch(err => {
+    if (err instanceof MissingWorkflow) return { state: 'warning', note: err.message }
+    throw err
+  })
+
 /** Asks GitHub about one track. Throws GhError when gh fails; the caller backs off. */
 export const gather = async (track: Track, ctx: Ctx): Promise<Facts> => {
   const pr = await prView(ctx.run, track.repo, track.number)
@@ -232,14 +239,14 @@ export const gather = async (track: Track, ctx: Ctx): Promise<Facts> => {
     ctx.defaultBranches.set(track.repo, branch)
   }
   const baseMerged = pr.state === 'OPEN' && pr.baseRefName !== branch ? await branchPrMerged(ctx.run, track.repo, pr.baseRefName) : false
-  const facts: Facts = { pr, defaultBranch: branch, baseMerged, prCi: await prCiFact(ctx, track.repo, pr), deploys: {}, checks: {} }
+  const facts: Facts = { pr, defaultBranch: branch, baseMerged, prCi: await orMissing(prCiFact(ctx, track.repo, pr)), deploys: {}, checks: {} }
   if (pr.state === 'MERGED' && pr.mergeCommit) {
-    facts.mainCi = await mainCiFact(ctx, track.repo, pr, branch)
+    facts.mainCi = await orMissing(mainCiFact(ctx, track.repo, pr, branch))
     if (facts.mainCi.state === 'passed' || facts.mainCi.state === 'skipped') {
       for (const d of ctx.config.deploys) {
         // A deploy that passed stays passed: later runs ship later commits.
         if (track.stages.some(s => s.id === `deploy:${d.name}` && s.state === 'passed')) continue
-        facts.deploys[d.name] = await deployFact(ctx, track.repo, pr, branch, d)
+        facts.deploys[d.name] = await orMissing(deployFact(ctx, track.repo, pr, branch, d))
       }
       facts.checks = await checkFacts(ctx, track, facts)
     }
