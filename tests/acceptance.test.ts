@@ -124,3 +124,34 @@ test('a broken config edit keeps the last good config, so deploy stages stay (re
   expect(await ui.find({ type: 'Text', text: /#42 ■■■□\s+web waiting/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /⚠ \.claude\/ship-progress\.json: not valid JSON/ })).toBeDefined()
 })
+
+test('alert preferences come from the session config, also for a PR in another repo', async ($, on) => {
+  const quiet = '{"version":1,"notify":{"macos":false,"wakeAgent":false}}'
+  const clock = mock.clock(on, { now: T0 })
+  mock.store(on, {})
+  mock.env(on, {})
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  on('session.repo', () => ({ value: { root: '/r', remote: 'git@github.com:o/r.git', internal: false, name: null } }))
+  on('tool.register', ($, e) => ({ value: { tool: `mcp__ship-progress__${e.name}` } }))
+  on('command.register', ($, e) => ({ value: { command: e.name } }))
+  on('fs.stat', () => ({ value: { kind: 'file', size: quiet.length, mtimeMs: 1, isLink: false } }))
+  on('fs.read', () => ({ value: quiet }))
+  const prompts: string[] = []
+  on('prompt.submit', ($, e) => {
+    prompts.push(e.text)
+    return { text: e.text }
+  })
+  const gh = fakeGh([['pr view 5 --repo other/x', MERGED], ['repo view other/x', { defaultBranchRef: { name: 'main' } }], ['run list', [run(7)]]])
+  const spawned: string[] = []
+  on('process.run', async ($, e) => {
+    spawned.push(e.argv[0]!)
+    return { value: await gh.run(e.argv) }
+  })
+  await $.session.start({ cwd: '/r', surface: 'terminal', isInteractive: true })
+  await $.command.run({ command: 'track', args: 'other/x#5' } as never)
+  await clock.advance(5_000)
+  await clock.settle()
+  expect((await $.command.run({ command: 'track', args: '' } as never)).text).toMatch(/other\/x#5 ■■■\s+live/)
+  expect(prompts).toEqual([])
+  expect(spawned.filter(c => c === 'osascript' || c === 'uname')).toEqual([])
+})
