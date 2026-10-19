@@ -9,7 +9,7 @@ A Claude Code mod that shows, above the prompt, where each pull request stands o
 #605 ✕□□□□  PR CI failed 2m 41f0e2aa ⚠ CI / unit failed
 ```
 
-![A live session: PRs tracked above the prompt, one opened by the agent and followed through CI](docs/demo.gif)
+![A live session: PRs tracked above the prompt, a new one followed through its CI run](docs/demo.gif)
 
 It follows each PR through **PR CI → merged → main CI → deploys → custom checks**. It polls `gh` on a timer, so the agent doesn't spend turns watching CI, and it alerts when a stage fails or a PR goes live: it wakes the agent, raises a macOS notification, and posts to Slack if you configure a webhook.
 
