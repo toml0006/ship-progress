@@ -162,12 +162,13 @@ async function poll($: $, t: number) {
       const tracks = x.tracks.map(y => {
         if (y.key !== track.key) return y
         const next = apply(y, facts, cfg, t)
-        alerts = transitions(y, next, cfg.notify, repo).filter(a => !x.alerts.includes(a.key))
+        // Alert preferences are the session's, whichever repo the PR is in.
+        alerts = transitions(y, next, config.notify, repo).filter(a => !x.alerts.includes(a.key))
         return next
       })
       return { ...x, tracks, logShas: cache.logShas, contains: cache.contains, alerts: [...x.alerts, ...alerts.map(a => a.key)] }
     })
-    for (const a of alerts) void sendAlert($, a, cfg).catch(err => $.ui.log(`ship-progress alert failed: ${err instanceof Error ? err.message : 'error'}`, { to: 'debug' }))
+    for (const a of alerts) void sendAlert($, a, config).catch(err => $.ui.log(`ship-progress alert failed: ${err instanceof Error ? err.message : 'error'}`, { to: 'debug' }))
   }
   backoffMs = failure ? Math.min(MAX_BACKOFF_MS, Math.max(RUNNING_MS, backoffMs) * 2) : 0
   await setMeta($, { ghError: failure })
